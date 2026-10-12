@@ -2,7 +2,7 @@
 
 **Proyecto:** `gatoXIII/gato_animacion/rostro_animado`
 **Documento base:** Especificación Técnica — Sistema de Seguimiento Facial para Bot Animado SVG
-**Versión:** 1.0 · **Estado:** Aprobado para ejecución · **Alcance:** Fases 1 y 2 (demografía diferida)
+**Versión:** 1.0 · **Estado:** Aprobado para ejecución · 
 
 ---
 
