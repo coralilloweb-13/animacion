@@ -1276,3 +1276,32 @@ svg.is-sketch .mm-spark {
   margin-top: 16px;
 }
 .call-hint { font-size: 12px; color: var(--muted); margin-top: 10px; }
+
+/* ═══════ v2.3 · Seguimiento facial ═══════ */
+.track-badge {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  z-index: 5;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: .04em;
+  background: rgba(0, 0, 0, .45);
+  color: #cfe8ff;
+  border: 1px solid rgba(120, 180, 255, .35);
+  pointer-events: none;
+}
+.track-badge.st-active   { color: #8ce6b0; border-color: rgba(90, 210, 140, .5); }
+.track-badge.st-acquiring{ color: #ffe9a8; border-color: rgba(230, 200, 90, .5); }
+.track-badge.st-lost     { color: #ffd0a0; border-color: rgba(240, 170, 90, .5); }
+.track-badge.st-error    { color: #ff9c9c; border-color: rgba(240, 110, 110, .55); }
+.track-preview {
+  width: 100%;
+  margin-top: 8px;
+  border-radius: 10px;
+  background: #000;
+  aspect-ratio: 4 / 3;
+  object-fit: cover;
+}
+#faceTrackToggle.active { background: #1d4d33; color: #8ce6b0; border-color: #2e7a50; }

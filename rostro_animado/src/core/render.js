@@ -796,7 +796,7 @@
             applySketchChrome(sketchOn, b.color);
          }
 
-         var yaw = b.yaw || 0;
+         var yaw = (b.yaw || 0) + ((pose.face && pose.face.lookYaw) || 0);
          setEye(eyeL, pose.left, 0, sketch, yaw);
          setEye(eyeR, pose.right, 1, sketch, yaw);
 

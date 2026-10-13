@@ -359,7 +359,11 @@
   var DEFAULT_EYE = { x: 0, y: 0, scaleX: 1, scaleY: 1, rotate: 0, open: 1, color: '@eye', lookX: 0, lookY: 0, pupil: 1, wet: 0 };
   var DEFAULT_FACE = {
     blush: 0, browVis: 0, browTilt: 0, browRaise: 0,
-    mouthX: 0, mouthY: 0, mouthSX: 1, mouthSY: 1
+    mouthX: 0, mouthY: 0, mouthSX: 1, mouthSY: 1,
+    /* v2.3 (tracking facial): giro de cabeza rastreado en radianes. Canal
+     * SEPARADO de body.yaw — este no alimenta los disparadores de partículas
+     * de spin (fx.js sigue leyendo exclusivamente body.yaw/dYaw). */
+    lookYaw: 0
   };
 
   function defaultPose() {
@@ -862,6 +866,15 @@
     this._seed = Math.random() * 100;
     this._events = {};
     this._gaze = { x: 0, y: 0, tx: 0, ty: 0 };
+    /* v2.3 (tracking facial): árbitro de mirada — cada fuente (puntero, tracker)
+     * registra su objetivo con prioridad; gana la de mayor prioridad y las
+     * fuentes caducas (>400 ms sin actualización) se autoexpulsan, de modo que
+     * un tracker caído devuelve el control al puntero sin intervención externa. */
+    this._gazeSources = {};
+    this._lookYawTarget = null;      /* giro de cabeza rastreado (rad) o null */
+    this._lookYaw = spring(0);
+    this._eyeOpenExt = null;         /* apertura externa [0,1] o null (D15) */
+    this._eyeOpenExtSpring = null;
     this._style = { sketch: 0 };
     this._theme = opts.color
       ? { body: opts.color, eyes: opts.eyeColor || '#FFFFFF' }
@@ -982,6 +995,10 @@
     /* ---------- núcleo: cambiar emoción (con valor de respaldo) ---------- */
     setEmotion: function (id, o) {
       o = o || {};
+      /* v2.3: una orden de emoción explícita cuenta como actividad — reinicia el
+       * reloj idle para que un payload de IA no quede pisado por el standby a los
+       * 60 s ni por el sueño a los 180 s. */
+      if (!o.auto) this._lastActivity = performance.now();
       var def = this._getDef(id);
       if (!def) {
         console.warn('[MoodMates] emoción ID desconocida "' + id + '", recayendo en espera (' + this._fallbackId + ')');
@@ -1085,15 +1102,57 @@
 
     resetIdle: function () { this._lastActivity = performance.now(); },
 
-    /* Punto de mira: desviación horizontal ±24, vertical ±15 (coordenadas viewBox) */
-    setGaze: function (nx, ny) {
-      this._gaze.tx = clamp(nx, -1, 1) * 24;
-      this._gaze.ty = clamp(ny, -1, 1) * 15;
+    /* Punto de mira: desviación horizontal ±24, vertical ±15 (coordenadas viewBox).
+     * v2.3 — firma extendida RETROCOMPATIBLE: setGaze(nx, ny[, {source, priority}]).
+     * Con 2 argumentos se usa la fuente 'default' prioridad 1 → comportamiento idéntico
+     * al anterior para todos los callers existentes. El árbitro (_arbitrateGaze) hace
+     * que la fuente de mayor prioridad gane (tracker=10 > puntero=1); las fuentes sin
+     * actualización durante >400 ms caducan y ceden el control automáticamente. */
+    setGaze: function (nx, ny, o) {
+      o = o || {};
+      var src = typeof o.source === 'string' && o.source ? o.source : 'default';
+      var pri = typeof o.priority === 'number' && isFinite(o.priority) ? o.priority : 1;
+      this._gazeSources[src] = {
+        x: clamp(nx, -1, 1),
+        y: clamp(ny, -1, 1),
+        pri: pri,
+        at: performance.now()
+      };
+      this._arbitrateGaze();
       return this;
     },
-    clearGaze: function () {
-      this._gaze.tx = 0;
-      this._gaze.ty = 0;
+    clearGaze: function (o) {
+      var src = (o && typeof o.source === 'string' && o.source) ? o.source : 'default';
+      delete this._gazeSources[src];
+      this._arbitrateGaze();
+      return this;
+    },
+    _arbitrateGaze: function () {
+      var best = null, now = performance.now();
+      for (var k in this._gazeSources) {
+        var s = this._gazeSources[k];
+        if (now - s.at > 400) { delete this._gazeSources[k]; continue; }  /* fuente caída */
+        if (!best || s.pri > best.pri) best = s;
+      }
+      this._gaze.tx = best ? best.x * 24 : 0;
+      this._gaze.ty = best ? best.y * 15 : 0;
+    },
+
+    /* v2.3 — giro de cabeza rastreado (radianes) por canal propio lookYaw.
+     * body.yaw queda reservado al spin elástico (fx/partículas). null/0 = reposo. */
+    setLookYaw: function (rad) {
+      var v = +rad;
+      this._lookYawTarget = isFinite(v) ? clamp(v, -0.85, 0.85) : 0;
+      return this;
+    },
+
+    /* v2.3 (D15) — apertura externa de párpados [0,1] desde EAR del tracker.
+     * Mezcla MULTIPLICATIVA con el parpadeo autónomo (los dos sobreviven);
+     * null devuelve el control íntegro al sistema de parpadeo interno. */
+    setEyeOpen: function (v) {
+      if (v == null) { this._eyeOpenExt = null; return this; }
+      var n = +v;
+      this._eyeOpenExt = isFinite(n) ? clamp(n, 0, 1) : null;
       return this;
     },
     setStyle: function (style) {
@@ -1405,6 +1464,12 @@
         springStep(this._ringSpring, this._ringSpeed, 1, j);
         springStep(this._mouthSpring, 9, 1, j);
         springStep(this._open, 26, 1, j);
+        /* v2.3: el giro rastreado pasa por su propio resorte (ω=5): inercia
+         * natural de cabeza sin transmitir jitter de landmarks al render. */
+        if (this._lookYawTarget != null) {
+          this._lookYaw.t = this._lookYawTarget;
+          springStep(this._lookYaw, 5, 1, j);
+        }
         if (this._spin) {
           springStep(this._spin, 6.2, 1, j);
           if (Math.abs(this._spin.t - this._spin.x) < 0.01 && Math.abs(this._spin.v) < 0.05) {
@@ -1413,6 +1478,7 @@
         }
       }
       pose.body.yaw = this._spin ? this._spin.x : 0;
+      pose.face.lookYaw = this._lookYawTarget != null ? this._lookYaw.x : 0;
 
       /* ---- Desplazamiento de rebote ---- */
       if (this._bounceAt >= 0) {
@@ -1519,6 +1585,15 @@
 
       /* apertura = valor base de configuración × resorte de parpadeo */
       var openS = clamp(this._open.x, 0.02, 1.5);
+      /* v2.3 (D15): apertura externa del tracker pasa por su propio resorte
+       * (ω=14) y se MEZCLA MULTIPLICATIVAMENTE — el parpadeo autónomo sigue
+       * visible sobre la apertura rastreada; null → control interno puro. */
+      if (this._eyeOpenExt != null) {
+        this._eyeOpenExtSpring = this._eyeOpenExtSpring || spring(1);
+        this._eyeOpenExtSpring.t = this._eyeOpenExt;
+        for (var eo = 0; eo < steps; eo++) springStep(this._eyeOpenExtSpring, 14, 1, j);
+        openS = clamp(openS * clamp(this._eyeOpenExtSpring.x, 0, 1), 0.02, 1.5);
+      }
       pose.left.open = clamp(pose.left.open, 0, 1.3) * openS;
       pose.right.open = clamp(pose.right.open, 0, 1.3) * openS;
 

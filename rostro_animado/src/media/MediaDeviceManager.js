@@ -89,6 +89,13 @@
     this.stream = null;             /* MediaStream activo */
     this.track = null;              /* MediaStreamTrack principal */
     this.deviceId = '';             /* deviceId seleccionado en el select */
+    /* FIX bug histórico: CameraManager.__name se define sobre la FUNCIÓN
+     * constructora tras reasignar el prototipo; cualquier instancia creada por
+     * otra vía (o subclase futura sin __name) emitía data.manager === undefined
+     * y CallSession nunca reaccionaba a start/stop/mute vía onChange.
+     * Fuente única ahora: _mmName asignado por el coordinador. */
+    this._mmName = kind === 'videoinput' ? 'camera' : 'microphone';
+    this.extraConstraints = null;   /* { width, height, frameRate, facingMode } — tracking D14 */
     this.listeners = [];
   }
 
@@ -98,7 +105,7 @@
   };
 
   TrackManager.prototype._emit = function (evt, payload) {
-    var data = Object.assign({ manager: this.constructor.__name__, kind: this.kind }, payload || {});
+    var data = Object.assign({ manager: this._mmName || 'unknown', kind: this.kind }, payload || {});
     this.listeners.slice().forEach(function (fn) {
       try { fn(evt, data); } catch (e) { console.error(e); }
     });
@@ -113,9 +120,16 @@
 
   /** Construye las constraints específicas del tipo de pista. */
   TrackManager.prototype._constraintsFor = function (deviceId) {
+    /* FIX D14: antes solo se admitía deviceId; ahora `extraConstraints` permite
+     * a la cámara de tracking pedir resolución/tasa bajas sin tocar el resto. */
+    var extra = (this.extraConstraints && typeof this.extraConstraints === 'object')
+      ? this.extraConstraints : null;
     var base = deviceId ? { deviceId: { exact: deviceId } } : true;
     if (this.kind === 'videoinput') {
-      return { video: base, audio: false };
+      if (base === true) {
+        return { video: extra ? Object.assign({ facingMode: 'user' }, extra) : true, audio: false };
+      }
+      return { video: Object.assign({}, base, extra || {}), audio: false };
     }
     /* Micrófono: cadena completa de procesamiento de voz por defecto. */
     var audio = base === true
@@ -137,6 +151,18 @@
       this.track = this.kind === 'videoinput'
         ? this.stream.getVideoTracks()[0]
         : this.stream.getAudioTracks()[0];
+
+      /* D14: si hay constraints extra, refinar la pista ya abierta (los navegadores
+       * aceptan mal deviceId+width simultáneos en algunos HW; applyConstraints es
+       * la vía robusta y degrada con aviso, nunca aborta el arranque). */
+      if (this.kind === 'videoinput' && this.extraConstraints &&
+          this.track && this.track.applyConstraints) {
+        try {
+          await this.track.applyConstraints(this.extraConstraints);
+        } catch (e) {
+          this._emit('warning', { message: 'applyConstraints parcial: ' + e.message });
+        }
+      }
 
       var actual = ((this.track.getSettings && this.track.getSettings()) || {}).deviceId;
       if (this.deviceId && actual && actual !== this.deviceId) {
@@ -221,7 +247,7 @@
   SpeakerManager.prototype.on = TrackManager.prototype.on;
 
   SpeakerManager.prototype._emit = function (evt, payload) {
-    var data = Object.assign({ manager: 'speaker' }, payload || {});
+    var data = Object.assign({ manager: this._mmName || 'speaker' }, payload || {});
     this.listeners.slice().forEach(function (fn) {
       try { fn(evt, data); } catch (e) { console.error(e); }
     });
@@ -287,6 +313,20 @@
     this.microphone = new MicrophoneManager(this);
     this.speaker = new SpeakerManager(this, options.audioElements || []);
 
+    /* Registry explícito de nombres (fuente única para los eventos _emit;
+     * sustituye al frágil this.constructor.__name__). */
+    this.camera._mmName = 'camera';
+    this.microphone._mmName = 'microphone';
+    this.speaker._mmName = 'speaker';
+
+    /* D14 fusionado: segunda CameraManager dedicada al seguimiento facial.
+     * Reutiliza PermissionManager, getUserMedia inyectable y la tubería de
+     * eventos — cero lógica de permisos/cámara duplicada. No toca
+     * this.videoElement (el visible es de la llamada; el del tracking lo
+     * gestiona MM_Tracking con su propio <video>). */
+    this.trackingCamera = new CameraManager(this);
+    this.trackingCamera._mmName = 'trackingCamera';
+
     this.videoElement = options.videoElement || null;
     this.devices = { videoinputs: [], audioinputs: [], audiooutputs: [] };
     this._deviceChangeHandler = null;
@@ -348,6 +388,26 @@
     if (this.videoElement) this.videoElement.srcObject = null;
   };
 
+  /**
+   * D14 fusionado: enciende la SEGUNDA cámara (tracking facial) con constraints
+   * configurables de baja resolución. Reutiliza todo el stack de MM_Media:
+   * getUserMedia inyectable, detección de fallback, eventos 'start/stop/error'
+   * con manager='trackingCamera'. Devuelve el MediaStream para que MM_Tracking
+   * lo enganche a su <video>.
+   */
+  MediaDeviceManager.prototype.startTrackingCamera = async function (constraints, deviceId) {
+    var tc = this.trackingCamera;
+    tc.extraConstraints = Object.assign(
+      { width: 320, height: 240, frameRate: 30 },
+      constraints && typeof constraints === 'object' ? constraints : {}
+    );
+    return tc.start(deviceId != null && deviceId !== undefined ? deviceId : tc.deviceId);
+  };
+
+  MediaDeviceManager.prototype.stopTrackingCamera = function () {
+    this.trackingCamera.stop();
+  };
+
   MediaDeviceManager.prototype.startMicrophone = function (deviceId) {
     return this.microphone.start(deviceId);
   };
@@ -382,6 +442,7 @@
   MediaDeviceManager.prototype.getState = function () {
     return {
       cameraOn: this.camera.isRunning(),
+      trackingCameraOn: this.trackingCamera.isRunning(),
       micOn: this.microphone.isRunning(),
       micMuted: this.microphone.isMuted(),
       cameraMuted: this.camera.isMuted(),
@@ -393,6 +454,7 @@
   /** Detiene todo y libera listeners. */
   MediaDeviceManager.prototype.dispose = function () {
     this.stopCamera();
+    this.stopTrackingCamera();
     this.stopMicrophone();
     this.unwatchDeviceChanges();
     this.onChange = null;

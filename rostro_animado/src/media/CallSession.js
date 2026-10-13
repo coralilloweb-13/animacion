@@ -35,8 +35,12 @@
 (function (global) {
   'use strict';
 
-  /* Emociones usadas por la sesión (ver docs/INTEGRATION.md, tabla de segmentos). */
-  var EMO = {
+  /* Mapa estado→emoción de la sesión. v2.3: fuente única MM_EmotionPolicy
+   * (inyectable por host vía options.emotionMap / options.policy). Si el
+   * módulo no está cargado, se usa DEFAULT_CALL_MAP — mismo contrato que
+   * el EMO histórico, migración sin cambio de comportamiento. */
+  var POLICY_NS = global.MM_EmotionPolicy;
+  var EMO = Object.assign({}, (POLICY_NS && POLICY_NS.DEFAULT_CALL_MAP) || {
     standby: '02',
     curious: '03',
     happy: '10',
@@ -45,7 +49,18 @@
     done: '33',
     error: '34',
     reject: '38'
-  };
+  });
+
+  function resolvePolicy(options) {
+    if (options.policy) return options.policy;
+    if (!POLICY_NS) return null;
+    return POLICY_NS.create({
+      call: options.emotionMap,
+      exists: global.MoodMates && global.MoodMates.config && global.MoodMates.config.getRaw
+        ? function (id) { return !!global.MoodMates.config.getRaw(id); }
+        : null
+    });
+  }
 
   function create(options) {
     options = options || {};
@@ -55,6 +70,12 @@
     if (!W) throw new Error('MM_Call: cargue primero src/media/WebRTCClient.js');
 
     var mate = options.mate || null;   /* instancia del motor MoodMates (opcional) */
+
+    /* Política de emociones por sesión: si el host inyecta policy/emotionMap,
+     * los ids se resuelven contra ella (con validación exists→fallback '02').
+     * El objeto EMO compartido sigue siendo la semilla para hosts sin política. */
+    var policy = resolvePolicy(options);
+    function emo(key) { return policy ? policy.call(key) : EMO[key]; }
 
     /* ---- traductor de estados → emociones del bot ---- */
     function react(emotionId, tips) {
@@ -70,12 +91,12 @@
       audioElements: options.audioElements || [],
       onChange: function (evt, data) {
         if (options.onMediaEvent) options.onMediaEvent(evt, data);
-        if (evt === 'start' && data.manager === 'camera') react(EMO.curious);
-        if (evt === 'stop' && data.manager === 'camera') react(EMO.standby);
+        if (evt === 'start' && data.manager === 'camera') react(emo('curious'));
+        if (evt === 'stop' && data.manager === 'camera') react(emo('standby'));
         if (evt === 'mute' && data.manager === 'microphone') {
-          react(data.muted ? EMO.reject : EMO.standby);
+          react(data.muted ? emo('reject') : emo('standby'));
         }
-        if (evt === 'error') react(EMO.error, data.message);
+        if (evt === 'error') react(emo('error'), data.message);
       }
     });
 
@@ -95,13 +116,13 @@
         onEvent: function (evt, data) {
           if (options.onCallEvent) options.onCallEvent(evt, data);
           if (evt === 'state') {
-            if (data.state === 'connecting') react(EMO.thinking, 'Conectando…');
-            else if (data.state === 'connected') { react(EMO.done); if (mate) mate.celebrate(); }
-            else if (data.state === 'disconnected' || data.state === 'failed') react(EMO.error);
-            else if (data.state === 'idle') react(EMO.standby);
+            if (data.state === 'connecting') react(emo('thinking'), 'Conectando…');
+            else if (data.state === 'connected') { react(emo('done')); if (mate) mate.celebrate(); }
+            else if (data.state === 'disconnected' || data.state === 'failed') react(emo('error'));
+            else if (data.state === 'idle') react(emo('standby'));
           }
-          if (evt === 'remote-stream') react(EMO.surprise);
-          if (evt === 'error') react(EMO.error, data.message);
+          if (evt === 'remote-stream') react(emo('surprise'));
+          if (evt === 'error') react(emo('error'), data.message);
         }
       });
       return rtc;
@@ -118,11 +139,11 @@
         try { await media.requestPermissions(); }
         catch (e) {
           /* Denegado: seguimos sin labels pero la app sigue viva. */
-          react(EMO.error, 'Permiso de cámara/micrófono denegado');
+          react(emo('error'), 'Permiso de cámara/micrófono denegado');
         }
         await media.refreshDevices();
         media.watchDeviceChanges(function (devices) {
-          react(EMO.standby);
+          react(emo('standby'));
           if (options.onDevicesChanged) options.onDevicesChanged(devices);
         });
         return media.devices;
@@ -140,7 +161,7 @@
         if (rtc) { rtc.disconnect(); }
         media.stopCamera();
         media.stopMicrophone();
-        react(EMO.standby);
+        react(emo('standby'));
       },
 
       toggleMute: function () {
@@ -148,12 +169,12 @@
         var muted = !wasMuted;
         media.setMuted(muted, 'microphone');
         /* El evento 'mute' solo vive si hay pista; reaccionar también sin stream. */
-        react(muted ? EMO.reject : EMO.standby);
+        react(muted ? emo('reject') : emo('standby'));
         return muted;
       },
 
       toggleCamera: function () {
-        if (media.camera.isRunning()) { media.stopCamera(); react(EMO.standby); return false; }
+        if (media.camera.isRunning()) { media.stopCamera(); react(emo('standby')); return false; }
         media.startCamera(media.camera.deviceId);
         return true;
       },
