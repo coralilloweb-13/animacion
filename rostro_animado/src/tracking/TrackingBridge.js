@@ -109,9 +109,36 @@
     var earClosed = opts.earClosed != null ? opts.earClosed : 0.06;
     var earOpen = opts.earOpen != null ? opts.earOpen : 0.22;
     var mirror = opts.mirror !== false;
+    /* v2.5 — modo de mirada (decisión de producto):
+     *   'attend' (default): el avatar MIRAL AL USUARIO — la posición del rostro
+     *     dentro del encuadre se mapea a gaze objetivo y giro de cabeza. Con
+     *     webcam espejada, moverse a la derecha del encuadre → el bot mira y
+     *     gira a su derecha (coincidencia visual directa con el usuario).
+     *   'mimic': copia la dirección de mirada/yaw del usuario (plan D7/D10
+     *     original; el avatar imita en vez de atender).
+     * irisGaze/yawFromLandmarks devuelven HACIA DÓNDE mira/gira la persona, no
+     * DÓNDE está: en 'attend' esas señales se ignoran para gaze/yaw y manda la
+     * geometría del rostro en el frame. El parpadeo (EAR) sigue siendo imitación
+     * en ambos modos (único canal mimic por diseño). */
+    var mode = (opts.mode === 'mimic') ? 'mimic' : 'attend';
+    var attendGainX = opts.attendGainX != null ? +opts.attendGainX : 2.4;
+    var attendGainY = opts.attendGainY != null ? +opts.attendGainY : 1.6;
+    var attendYawK  = opts.attendYawK  != null ? +opts.attendYawK  : 0.9;
+    /* parches.md §2a — compatibilidad con la API del patch: ganancia única y
+     * tope de yaw; los nombres específicos v2.5 (attendGainX/Y, attendYawK)
+     * siguen teniendo prioridad si se pasan en opts. */
+    var attendGain = opts.attendGain != null ? +opts.attendGain : 1.5;
+    var attendYawCap = opts.attendYaw != null ? +opts.attendYaw : 0.45;
     var oe = opts.oneEuro || {};
+    function dz(v) { return Math.abs(v) < 0.04 ? 0 : v; }
+    function absUrl(u) { try { return new URL(u, document.baseURI).href; } catch (e) { return u; } }
 
     var state = 'IDLE';
+    /* v2.5 — epoch/generación: si destroy() ocurre durante start() (await de
+     * backend.init/acquireStream), las promesas en vuelo y el rAF del ciclo
+     * anterior deben autodescartarse; sin esto quedaba cámara abierta + bridge
+     * fantasma inferenciando contra un mate destruido. */
+    var epoch = 0;
     var listeners = [];
     var rafId = 0;
     var stopped = true;
@@ -126,11 +153,30 @@
       oe.beta != null ? oe.beta : 0.007,
       oe.dCutoff != null ? oe.dCutoff : 1.0);
 
+    /* Selección de rostro objetivo (plan §3). opts.selector permite inyectar
+     * una política propia (mock en tests / VAD externo); opts.maxFaces>1 activa
+     * el FaceSelector por defecto; maxFaces===1 lo desactiva (v2.3 clásico). */
+    var selector = null;
+    if (typeof opts.selector === 'object' && opts.selector && typeof opts.selector.select === 'function') {
+      selector = opts.selector;                       /* política inyectada por el host */
+    } else if (T.FaceSelector && (opts.maxFaces == null ? 3 : opts.maxFaces) > 1) {
+      selector = T.FaceSelector.create(Object.assign(
+        { maxFaces: opts.maxFaces != null ? opts.maxFaces : 3 },
+        opts.selectorOpts || {}));
+    } else {
+      selector = null;                                 /* cara 0 clásico (v2.3) */
+    }
+
     /* ---- vídeo de captura (oculto salvo que el host dé uno visible) ---- */
     var video = opts.videoElement || document.createElement('video');
     if (!opts.videoElement) {
       video.muted = true; video.playsInline = true; video.autoplay = true;
+      /* v2.5 FIX — era opacity:0 SIN position:absolute: un <video> con stream
+       * activo ocupa flujo normal, empujaba el layout del stage y en algunos
+       * navegadores se autorretrataba sobre la escena. 1px + aria-hidden basta. */
       video.style.position = 'absolute';
+      video.style.left = '-9999px';
+      video.style.top = '0';
       video.style.width = '1px';
       video.style.height = '1px';
       video.style.opacity = '0';
@@ -169,7 +215,10 @@
       /* Owner por defecto 'call': si nadie gestiona el owner (modo standalone),
        * las señales de emoción se suprimen — el tracking solo mueve mirada,
        * párpados y giro de cabeza, nunca la expresión. */
-      var emotional = opts.signals !== false && !!policy;
+      /* parches.md §2b — señales de emoción ahora son OPT-IN: solo con
+       * opts.signals === true explícito (y política + owner 'tracking').
+       * false/undefined → el tracking jamás toca la expresión. */
+      var emotional = opts.signals === true && !!policy;
       if (s === 'LOST') {
         if (emotional && policy.owner() === 'tracking') {
           adapter.handleAIMessage({ emotionId: policy.tracking('lost') });
@@ -204,21 +253,58 @@
       lastSeenAt = now;
       if (state !== 'ACTIVE') setState('ACTIVE', 'rostro-detectado');
 
-      var lmArr = raw.faces[0].lm.map(function (p) { return { x: p[0], y: p[1] }; });
+      /* Selección multi-cara (plan §3): FaceSelector decide el objetivo con
+       * histéresis; sin módulo cargado se degrada a cara 0 (comportamiento v2.3). */
+      var selectedFace = raw.faces[0];
+      if (selector) {
+        var pick = selector.select(raw.faces, now);
+        if (!pick) return;                       /* sin caras evaluables este frame */
+        if (pick.switched) emit('face-switch', { index: pick.index, score: pick.score });
+        selectedFace = pick.face;
+      }
+      var lmArr = selectedFace.lm.map(function (p) { return { x: p[0], y: p[1] }; });
 
       var earL = F.eyeAspectRatio(lmArr, 'left');
       var earR = F.eyeAspectRatio(lmArr, 'right');
-      var gazeL = F.irisGaze(lmArr, 'left');
-      var gazeR = F.irisGaze(lmArr, 'right');
-      var pose = F.yawFromLandmarks(lmArr, mirror);
-
-      var g = F.sanitizeVec(
-        ((gazeL.x + gazeR.x) / 2) * (mirror ? -1 : 1),
-        (gazeL.y + gazeR.y) / 2
-      );
       var openAvg = F.opennessFromEAR((earL + earR) / 2, earClosed, earOpen);
 
-      var f = bank.filter(now / 1000, { gx: g.x, gy: g.y, open: openAvg, yaw: pose.yaw });
+      var gazeX, gazeY, yawOut;
+      if (mode === 'mimic') {
+        var gazeL = F.irisGaze(lmArr, 'left');
+        var gazeR = F.irisGaze(lmArr, 'right');
+        /* Convención de signo (v2.3.2): el escenario NO aplica scaleX(-1) al
+         * personaje, así que la pantalla coincide con las coordenadas crudas de
+         * la cámara. irisGaze ya devuelve x en coordenadas de CABEZA (el ojo
+         * derecho se voltea internamente con sx=-1): NO volver a invertir. */
+        var pose = F.yawFromLandmarks(lmArr, false);
+        yawOut = mirror ? -pose.yaw : pose.yaw;
+        gazeX = (gazeL.x + gazeR.x) / 2;
+        gazeY = (gazeL.y + gazeR.y) / 2;
+      } else {
+        /* attend/parches.md §2c: dónde ESTÁ la persona en el encuadre → hacia
+         * dónde mira/gira el avatar. cx/cy normalizados [0,1] sobre los
+         * landmarks de la cara seleccionada; by0 sesgado a 0.45 porque los
+         * rostros suelen quedar algo por encima del centro del encuadre. */
+        var minX = 1, maxX = 0, minY = 1, maxY = 0;
+        for (var li = 0; li < lmArr.length; li++) {
+          var p = lmArr[li];
+          if (p.x < minX) minX = p.x;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
+        }
+        var cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+        var ex = mirror ? (0.5 - cx) : (cx - 0.5);   /* desplazamiento espejado */
+        gazeX = dz(ex * attendGainX);
+        gazeY = dz((cy - 0.5) * attendGainY);
+        /* parches.md: tope de giro configurable (attendYaw, defecto 0.45);
+         * sin override explícito se conserva el comportamiento v2.5 (0.6). */
+        var yawLimit = opts.attendYaw != null ? attendYawCap : 0.6;
+        yawOut = F.clamp(gazeX * attendYawK, -yawLimit, yawLimit); /* giro hacia el usuario */
+      }
+      var g = F.sanitizeVec(gazeX, gazeY);
+
+      var f = bank.filter(now / 1000, { gx: g.x, gy: g.y, open: openAvg, yaw: yawOut });
       var s = F.sanitizeVec(f.gx, f.gy);
 
       adapter.setGaze(s.x, s.y, { source: 'tracker', priority: TRACKER_PRIORITY });
@@ -239,6 +325,7 @@
         lastProbeAt = n;
       }
       inflight = true;
+      var myEpoch = epoch;
       try {
         var t = performance.now();
         var raw;
@@ -249,11 +336,16 @@
         } else {
           raw = await backend.frame(video, t);
         }
+        /* v2.5 — puente destruido/reiniciado durante la inferencia en vuelo:
+         * descartar resultado y detener este ciclo (no tocar mates viejos). */
+        if (myEpoch !== epoch || stopped) return;
         onFrame(raw);
       } catch (e) {
-        if (state !== 'ERROR') setState('ERROR', String((e && e.message) || e));
+        if (myEpoch === epoch && !stopped && state !== 'ERROR') {
+          setState('ERROR', String((e && e.message) || e));
+        }
       } finally {
-        inflight = false;
+        if (myEpoch === epoch) inflight = false;
       }
     }
 
@@ -307,20 +399,38 @@
 
       start: async function () {
         if (state === 'ACQUIRING' || state === 'ACTIVE') return;
+        epoch++;                          /* v2.5 — invalida ciclos anteriores */
+        var myEpoch = epoch;
         setState('ACQUIRING', 'start');
         try {
+          /* v2.5 FIX — cfg sin hardcodear rutas relativas duplicadas: se parte
+           * de la VENDOR_BASE resuelta por MpLoader (absoluta de origen), que
+           * también usa el MainThreadBackend y el worker para wasm/bundle. */
+          var vendor = (T.MpLoader && T.MpLoader.VENDOR_BASE) || 'assets/vendor/mediapipe/';
           var cfg = Object.assign({
-            bundleUrl: 'assets/vendor/mediapipe/vision_bundle.mjs',
-            wasmPaths: 'assets/vendor/mediapipe/wasm/',
-            modelPath: 'assets/vendor/mediapipe/face_landmarker.task',
+            bundleUrl: vendor + 'vision_bundle.mjs',
+            wasmPaths: vendor + 'wasm/',
+            modelPath: vendor + 'face_landmarker.task',
             delegate: opts.delegate || 'GPU',
-            numFaces: 1
+            numFaces: selector ? (opts.maxFaces != null ? opts.maxFaces : 3) : 1,
+            /* v2.3.2 — umbrales bajados de 0.5 (default) a 0.3: con iluminación
+             * mediocre/webcams de portátil el detector por debajo de 0.5 no
+             * entregaba caras y el bridge nunca llegaba a ACTIVE ("no sigue el
+             * rostro" sin ningún error en consola). */
+            minFaceDetectionConfidence: opts.minFaceDetectionConfidence != null ? opts.minFaceDetectionConfidence : 0.3,
+            minTrackingConfidence: opts.minTrackingConfidence != null ? opts.minTrackingConfidence : 0.3
           }, opts.loader || {});
           /* Normalización de claves: MpLoader usa modelPath; el worker usa
            * modelUrl. Sin esto, en el camino Worker el landmarker se creaba sin
            * modelo (modelAssetPath undefined) y la inferencia devolvía 0 caras:
            * "no sigue el rostro" incluso con todo lo demás correcto. */
           cfg.modelUrl = cfg.modelUrl || cfg.modelPath;
+          /* parches.md §2d — las URLs relativas dentro del Worker se resolvían
+           * contra src/tracking/track.worker.js (404 de bundle/WASM/modelo).
+           * Se pasan absolutas. */
+          ['bundleUrl', 'wasmPaths', 'modelPath', 'modelUrl'].forEach(function (k) {
+            if (typeof cfg[k] === 'string') cfg[k] = absUrl(cfg[k]);
+          });
           backend = T.Backends
             ? T.Backends.create(opts.backend || 'auto', {
                 workerUrl: opts.workerUrl,
@@ -329,25 +439,41 @@
             : null;
           if (!backend) throw new Error('cargue primero src/tracking/Backends.js');
           await backend.init(cfg);
+          if (myEpoch !== epoch || stopped) throw new Error('__cancelled__');
           await acquireStream();
+          if (myEpoch !== epoch || stopped) throw new Error('__cancelled__');
           await video.play();
+          if (myEpoch !== epoch || stopped) throw new Error('__cancelled__');
           stopped = false;
           lastSeenAt = performance.now();
           loop();
         } catch (e) {
+          if (String((e && e.message) || e) === '__cancelled__') {
+            /* destroy()/stop() durante el arranque: teardown completo aquí,
+             * NO propagar rechazo al caller (no es un fallo, es una cancelación). */
+            if (backend) { try { backend.dispose(); } catch (er) {} backend = null; }
+            releaseStream();
+            state = 'IDLE';
+            return;
+          }
           stopped = true;
           setState('ERROR', String((e && e.message) || e));
-          if (backend) { backend.dispose(); backend = null; }
+          if (backend) { try { backend.dispose(); } catch (er) {} backend = null; }
+          releaseStream();               /* v2.5 — no dejar LED encendido tras fallo */
           throw e;
         }
       },
 
-      stop: function () {
+      stop: function (stopOpts) {
+        epoch++;                          /* v2.5 — descarta work en vuelo */
         stopped = true;
         if (rafId) cancelAnimationFrame(rafId);
         rafId = 0;
         if (backend) { backend.dispose(); backend = null; }
-        releaseStream();
+        /* v2.5 — con stream compartido (opts.stream, sin cámara propia) NO se
+         * libera nada salvo que el host lo fuerce explícitamente: stop() de un
+         * bridge prestado no debe apagar la webcam de la llamada. */
+        if ((stopOpts && stopOpts.force) || ownStream) releaseStream();
         bank.reset();
         adapter.setEyeOpen(null);
         adapter.clearGaze({ source: 'tracker' });
@@ -359,6 +485,7 @@
        * la cámara propia si es exclusiva (evita dos luces LED encendidas). */
       suspend: function () {
         if (ownStream) { bridge.stop(); return; }
+        epoch++;                                /* v2.5 — descarta frame en vuelo */
         stopped = true;
         if (rafId) cancelAnimationFrame(rafId);
         rafId = 0;
@@ -366,11 +493,13 @@
       },
       resume: function () {
         if (ownStream) { bridge.start().catch(function () { /* ERROR ya emitido */ }); return; }
-        if (stopped) {
+        if (stopped && backend) {               /* v2.5 — sin backend no hay nada que reanudar */
           stopped = false;
           lastSeenAt = performance.now();
           setState('ACQUIRING', 'resume');
           loop();
+        } else if (stopped) {
+          bridge.start().catch(function () { /* ERROR ya emitido */ });
         }
       },
 
@@ -380,8 +509,50 @@
         return bridge;
       },
 
+      /* Reancla el motor objetivo sin reiniciar cámara ni recargar MediaPipe.
+       * Uso: cambio de personaje (createMain destruye la instancia vieja).
+       * Libera los canales del mate viejo (puede estar ya destruido: try/catch),
+       * valida el nuevo contra EngineAdapter y conmuta la referencia atómica. */
+      rebindMate: function (newMate) {
+        var next = T.EngineAdapter(newMate);   /* throws si no es un motor válido */
+        var old = adapter.mate;
+        if (old && old !== newMate) {
+          try {
+            old.clearGaze({ source: 'tracker' });
+            if (typeof old.setEyeOpen === 'function') old.setEyeOpen(null);
+            if (typeof old.setLookYaw === 'function') old.setLookYaw(0);
+          } catch (e) { /* instancia ya destruida: nada que liberar */ }
+        }
+        adapter = next;
+        bank.reset();
+        emit('rebind', { mate: newMate });
+        return bridge;
+      },
+
+      /* Inyección VAD/diarización (plan §3, contrato desacoplado): hint = key o
+       * índice de la cara activa, level ∈ [0,1]. Delega en FaceSelector si hay. */
+      setVoiceActivity: function (hint, level) {
+        if (selector && typeof selector.setVoiceActivity === 'function') {
+          selector.setVoiceActivity(hint, level);
+        }
+        return bridge;
+      },
+      get lockedFaceKey() { return selector ? selector.lockedKey : null; },
+
+      /* v2.5 — acceso al stream de captura (propio o compartido) para hosts
+       * que quieran mostrar preview o compartirlo con un segundo bridge
+       * (cero doble captura, plan §3). */
+      getStream: function () { return video.srcObject || null; },
+
       destroy: function () {
-        bridge.stop();
+        /* v2.5 — stop() liberaba la cámara SIEMPRE, incluso con opts.stream
+         * compartido (llamada): colgaba el vídeo local del usuario en plena
+         * videollamada. El bridge propio solo es dueño de lo que él abrió;
+         * force=true (host que se apaga explícitamente) libera igualmente. */
+        var ownStreamNow = ownStream;
+        bridge.stop({ force: true });
+        if (ownStreamNow) releaseStream();
+        if (selector && typeof selector.reset === 'function') selector.reset();
         listeners.length = 0;
         if (!opts.videoElement && video.parentNode) video.parentNode.removeChild(video);
       }

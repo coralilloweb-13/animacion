@@ -35,6 +35,8 @@
   var session = null;       /* MM_Call.create(...) */
 
   /* ---------------- Bot animado del overlay ---------------- */
+  var callBridge = null;        /* MM_Tracking sobre el bot de llamada (v2.4) */
+
   function buildBot(charId) {
     if (!MM || typeof MM.create !== 'function') {
       throw new Error('El motor MoodMates no está disponible. Verifica el orden de carga de engine.js.');
@@ -52,6 +54,62 @@
       $('callBotEmo').textContent = e.id + ' · ' + name;
     });
     if (session) session.setMate(mate);
+    /* El tracker de la llamada sigue al bot NUEVO si estaba en marcha. */
+    if (callBridge && window.MM_TRACKING) {
+      try { window.MM_TRACKING.callRebind(mate); } catch (e) { console.warn('[tracking] call rebind:', e.message || e); }
+    }
+  }
+
+  /* v2.4 — Tracking compartido durante la llamada:
+   *   - Si la galería tenía el tracker ACTIVO y expone su MediaStream, se crea
+   *     un bridge contra el bot de llamada con opts.stream (SIN segunda captura).
+   *   - Si no hay stream reutilizable, se abre uno propio vía MM_Media.
+   *   - Señales de emoción desactivadas (signals:false): la IA de la llamada es
+   *     la única dueña de las emociones (plan §4). */
+  /* parches.md §3b — sin stream compartido NO se abre una captura propia en
+   * la apertura del overlay: la cámara solo se enciende por acción explícita
+   * del usuario (botón de seguimiento o «Iniciar llamada» → stream local de
+   * la sesión, reutilizable vía MM_TRACKING.getStream()). */
+  function startCallTracking() {
+    if (callBridge || !mate || !window.MM_Tracking || !window.MM_SHARED_POLICY) return;
+    var stream = (window.MM_TRACKING && window.MM_TRACKING.getStream) ? window.MM_TRACKING.getStream() : null;
+    if (!stream) return;
+    try {
+      callBridge = window.MM_Tracking.create({
+        mate: mate,
+        stream: stream,
+        policy: window.MM_SHARED_POLICY,
+        signals: false,
+        mode: 'attend',
+        maxFaces: 3,
+        mirror: true,
+        lostAfterMs: 800
+      });
+      window.MM_TRACKING.setCallBridge(callBridge);
+      callBridge.on(function (evt, data) {
+        if (evt === 'warning') console.warn('[tracking-call]', data.message);
+        if (evt === 'error') console.error('[tracking-call]', data.message);
+      });
+      callBridge.start().then(function () {
+        var st = $('callStatus');
+        if (st && callBridge && callBridge.state === 'ACTIVE') st.textContent = 'Llamada + seguimiento facial activo.';
+      }).catch(function (e) {
+        console.warn('[tracking-call] no iniciado:', e.message || e);
+        stopCallTracking();
+      });
+    } catch (e) {
+      console.warn('[tracking-call] init falló:', e.message || e);
+      stopCallTracking();
+    }
+  }
+
+  function stopCallTracking() {
+    if (!callBridge) return;
+    try { callBridge.destroy(); } catch (e) { console.warn(e); }
+    callBridge = null;
+    if (window.MM_TRACKING && typeof window.MM_TRACKING.setCallBridge === 'function') {
+      window.MM_TRACKING.setCallBridge(null);
+    }
   }
 
   /* ---------------- Rellenado de selects de dispositivos ---------------- */
@@ -123,6 +181,8 @@
 
     session = MM_Call.create({
       mate: mate,
+      /* parches.md §3c — política de emoción única compartida */
+      policy: window.MM_SHARED_POLICY,
       videoElement: $('callLocalVideo'),
       audioElements: [$('callRemoteAudio')],
       roomId: 'bot-call-index',
@@ -168,17 +228,47 @@
     requestAnimationFrame(function () { mask.classList.add('show'); });
     overlay.classList.add('open');
     overlay.setAttribute('aria-hidden', 'false');
+    /* v2.5b — el overlay queda accesible para AT solo cuando está abierto. */
+    try { overlay.inert = false; } catch (e) {}
+    /* v2.4 (criterio §2): el bot de llamada es el objetivo del tracker si estaba
+     * activo — se suspende el tracking de la galería para no mantener DOS
+     * capturas/instancias de MediaPipe. El stream NO se libera con stopTracking:
+     * lo reutilizamos como opts.stream del bridge de llamada (condición §3). */
+    if (window.MM_TRACKING && window.MM_TRACKING.active) {
+      try { window.MM_TRACKING.suspendForCall(); } catch (e) { console.warn('[tracking] suspend:', e.message || e); }
+    }
+    /* parches.md §3a — el bot de llamada debe existir ANTES de enlazar el
+     * tracker (mate era null en la primera apertura → MM_Tracking.create
+     * lanzaba y se tragaba con console.warn). */
+    ensureSession();         /* crea el bot antes de enlazar el tracker */
+    startCallTracking();     /* bridge sobre el bot de llamada (stream compartido si existe) */
     lazySetup();
   }
   function closeCall() {
     mask.classList.remove('show');
     setTimeout(function () { mask.hidden = true; }, 300);
+    /* v2.5b — FIX "Blocked aria-hidden on an element because its descendant
+     * retained focus": el foco estaba en #callClose (dentro del overlay) y al
+     * poner aria-hidden=true el navegador bloqueaba el atributo. Se saca el
+     * foco del interior ANTES de ocultarlo (devolviéndolo al botón que abrió
+     * el modal, patrón recomendado por WAI-ARIA) y se marca `inert`, que sí
+     * previene el foco además de ocultarlo a las tecnologías de asistencia. */
+    var active = document.activeElement;
+    if (active && overlay.contains(active)) {
+      try { (toggleBtn && toggleBtn.offsetParent !== null ? toggleBtn : document.body).focus({ preventScroll: true }); } catch (e) {}
+    }
     overlay.classList.remove('open');
+    try { overlay.inert = true; } catch (e) {}
     overlay.setAttribute('aria-hidden', 'true');
     /* al cerrar, colgar si estaba en llamada para liberar dispositivos */
     if (session && session.rtc && session.rtc.pc) {
       session.endCall();
       resetButtons();
+    }
+    /* devolver el tracker a la galería si seguía activo antes de la llamada */
+    stopCallTracking();
+    if (window.MM_TRACKING && window.MM_TRACKING.wasActiveBeforeCall) {
+      try { window.MM_TRACKING.restoreAfterCall(); } catch (e) { console.warn('[tracking] restore:', e.message || e); }
     }
   }
 
