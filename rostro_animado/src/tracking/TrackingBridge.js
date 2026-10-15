@@ -115,6 +115,7 @@
     var listeners = [];
     var rafId = 0;
     var stopped = true;
+    var epoch = 0;               /* invalida start() en vuelo al stop()/restart() */
     var lastSeenAt = 0;
     var lastProbeAt = 0;
     var inflight = false;
@@ -308,6 +309,14 @@
       start: async function () {
         if (state === 'ACQUIRING' || state === 'ACTIVE') return;
         setState('ACQUIRING', 'start');
+        /* v2.5.1 — F1: `stopped` vale true hasta el final de start(), por lo
+         * que cualquier comprobación `|| stopped` durante la secuencia de
+         * arranque cancela SIEMPRE el inicio (el catch disposeaba el backend,
+         * state quedaba IDLE sin evento y loop() nunca ejecutaba: cámara
+         * encendida, avatar sin seguir). Durante start() la única señal de
+         * cancelación válida es un stop()/restart() concurrente, que se
+         * detecta con el epoch propio. */
+        var myEpoch = ++epoch;
         try {
           var cfg = Object.assign({
             bundleUrl: 'assets/vendor/mediapipe/vision_bundle.mjs',
@@ -321,16 +330,29 @@
            * modelo (modelAssetPath undefined) y la inferencia devolvía 0 caras:
            * "no sigue el rostro" incluso con todo lo demás correcto. */
           cfg.modelUrl = cfg.modelUrl || cfg.modelPath;
+          /* F2: normalización de rutas contra document.baseURI — funciona en
+           * raíz y en subruta (GitHub Pages), y dentro del worker (que no tiene
+           * base propia para relativas). */
+          var abs = T.MpLoader && typeof T.MpLoader.absUrl === 'function'
+            ? T.MpLoader.absUrl : function (u) { try { return new URL(u, document.baseURI).href; } catch (e) { return u; } };
+          cfg.bundleUrl = abs(cfg.bundleUrl);
+          cfg.wasmPaths = abs(cfg.wasmPaths);
+          cfg.modelUrl = abs(cfg.modelUrl);
+          cfg.modelPath = cfg.modelUrl;
           backend = T.Backends
             ? T.Backends.create(opts.backend || 'auto', {
                 workerUrl: opts.workerUrl,
-                onError: function (e) { emit('warning', { message: e.message }); }
+                onError: function (e) { emit('warning', { message: e.message }); },
+                onWarning: function (e) { emit('warning', { message: e.message }); }
               })
             : null;
           if (!backend) throw new Error('cargue primero src/tracking/Backends.js');
           await backend.init(cfg);
+          if (myEpoch !== epoch) throw new Error('__cancelled__');
           await acquireStream();
+          if (myEpoch !== epoch) throw new Error('__cancelled__');
           await video.play();
+          if (myEpoch !== epoch) throw new Error('__cancelled__');
           stopped = false;
           lastSeenAt = performance.now();
           loop();
@@ -343,6 +365,7 @@
       },
 
       stop: function () {
+        epoch++;           /* invalida cualquier start() en vuelo (patch 2e) */
         stopped = true;
         if (rafId) cancelAnimationFrame(rafId);
         rafId = 0;
