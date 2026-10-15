@@ -27,7 +27,7 @@
    * WorkerBackend en la misma sesión comparten script del worker (cacheado por
    * el navegador, correcto); una recarga de página produce uno nuevo y fuerza
    * al navegador a bajar el track.worker.js actualizado (F3). */
-  var WORKER_VERSION = '25c' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+  var WORKER_VERSION = '252' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
 
   /* ---------------- WorkerBackend ---------------- */
 

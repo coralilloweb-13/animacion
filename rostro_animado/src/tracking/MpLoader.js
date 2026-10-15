@@ -38,7 +38,7 @@
    *  envenenado del grafo y fuerza recarga de workers/módulos obsoletos (F3/F4). */
   function withV(url) {
     var u = absUrl(url);
-    u += (u.indexOf('?') >= 0 ? '&' : '?') + 'v=25c' + (++_attempts) + Date.now().toString(36);
+    u += (u.indexOf('?') >= 0 ? '&' : '?') + 'v=252' + (++_attempts) + Date.now().toString(36);
     return u;
   }
 
@@ -181,6 +181,9 @@
     load: load,
     createLandmarker: createLandmarker,
     absUrl: absUrl,
-    VENDOR_BASE: VENDOR_BASE
+    /* v2.5.2 — getter dinámico: document.baseURI puede cambiar tras la
+     * carga del script (history.pushState / redirecciones SPA). Un valor
+     * congelado en tiempo de carga reintroduce F2 en subtítulos. */
+    get VENDOR_BASE() { return absUrl('assets/vendor/mediapipe/'); }
   };
 })(typeof window !== 'undefined' ? window : globalThis);
