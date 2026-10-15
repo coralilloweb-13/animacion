@@ -1,0 +1,15 @@
+./MANIFEST.txt
+./assets/vendor/mediapipe/face_landmarker.task
+./assets/vendor/mediapipe/vision_bundle.mjs
+./assets/vendor/mediapipe/wasm/vision_wasm_internal.js
+./assets/vendor/mediapipe/wasm/vision_wasm_internal.wasm
+./assets/vendor/mediapipe/wasm/vision_wasm_nosimd_internal.js
+./assets/vendor/mediapipe/wasm/vision_wasm_nosimd_internal.wasm
+./call.html
+./index.html
+./src/tracking/Backends.js
+./src/tracking/MpLoader.js
+./src/tracking/TrackingBridge.js
+./src/tracking/track.worker.js
+./tools/fetch-mediapipe.sh
+./tools/selftest.html
